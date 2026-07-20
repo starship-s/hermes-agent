@@ -1,3 +1,4 @@
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -361,6 +362,132 @@ def test_redeem_force_bypasses_exhaustion_guard(monkeypatch):
     assert post["url"] == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
     assert post["json"]["redeem_request_id"]  # idempotency key present
     assert "credit_id" not in post["json"]
+
+
+def test_redeem_uses_explicit_account_id_and_request_id(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeResetClient(
+            calls,
+            _usage_payload_with_resets(100, 30, 1),
+            consume_payload={"code": "reset", "windows_reset": 2},
+        ),
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "_resolve_codex_usage_credentials",
+        lambda base_url, api_key: (
+            "live-agent-token",
+            "https://chatgpt.com/backend-api/codex",
+            "resolver-account-id",
+        ),
+    )
+
+    request_id = "01234567-89ab-4def-8000-0123456789ab"
+    result = account_usage.redeem_codex_reset_credit(
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+        account_id="explicit-account-id",
+        redeem_request_id=request_id,
+    )
+
+    assert result.redeemed
+    get_headers = [c for c in calls if c["method"] == "GET"][0]["headers"]
+    post = [c for c in calls if c["method"] == "POST"][0]
+    assert get_headers["ChatGPT-Account-Id"] == "explicit-account-id"
+    assert post["headers"]["ChatGPT-Account-Id"] == "explicit-account-id"
+    assert post["json"]["redeem_request_id"] == request_id
+
+
+def test_redeem_generates_new_request_id_when_not_supplied(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeResetClient(
+            calls,
+            _usage_payload_with_resets(100, 30, 1),
+            consume_payload={"code": "reset", "windows_reset": 2},
+        ),
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "_resolve_codex_usage_credentials",
+        lambda base_url, api_key: (
+            "live-agent-token",
+            "https://chatgpt.com/backend-api/codex",
+            "resolver-account-id",
+        ),
+    )
+
+    result = account_usage.redeem_codex_reset_credit(
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert result.redeemed
+    post = [c for c in calls if c["method"] == "POST"][0]
+    generated_request_id = post["json"]["redeem_request_id"]
+    assert str(uuid.UUID(generated_request_id)) == generated_request_id
+
+
+def test_redeem_rejects_malformed_request_id_before_http(monkeypatch):
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: (_ for _ in ()).throw(AssertionError("httpx should not be called")),
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "_resolve_codex_usage_credentials",
+        lambda base_url, api_key: (_ for _ in ()).throw(
+            AssertionError("credentials resolution should not be attempted")
+        ),
+    )
+
+    result = account_usage.redeem_codex_reset_credit(
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+        redeem_request_id="not-a-uuid",
+    )
+
+    assert result.status == "unavailable"
+    assert "canonical UUID" in result.message
+
+
+def test_redeem_without_explicit_account_id_uses_resolved_id(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeResetClient(
+            calls,
+            _usage_payload_with_resets(100, 30, 1),
+            consume_payload={"code": "reset", "windows_reset": 2},
+        ),
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "_resolve_codex_usage_credentials",
+        lambda base_url, api_key: (
+            "live-agent-token",
+            "https://chatgpt.com/backend-api/codex",
+            "resolver-account-id",
+        ),
+    )
+
+    result = account_usage.redeem_codex_reset_credit(
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert result.redeemed
+    get_headers = [c for c in calls if c["method"] == "GET"][0]["headers"]
+    post_headers = [c for c in calls if c["method"] == "POST"][0]["headers"]
+    assert get_headers["ChatGPT-Account-Id"] == "resolver-account-id"
+    assert post_headers["ChatGPT-Account-Id"] == "resolver-account-id"
 
 
 def test_redeem_allowed_without_force_when_window_exhausted(monkeypatch):

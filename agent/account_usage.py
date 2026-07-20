@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -588,6 +589,8 @@ def redeem_codex_reset_credit(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    account_id: Optional[str] = None,
+    redeem_request_id: Optional[str] = None,
     force: bool = False,
 ) -> CodexResetRedeemResult:
     """Redeem one banked Codex rate-limit reset credit (`/usage reset`).
@@ -601,31 +604,48 @@ def redeem_codex_reset_credit(
        5h + weekly allowance; burning it early wastes it). The backend has
        the same protection (``nothing_to_reset`` doesn't consume the
        credit), but failing fast client-side gives a clearer message.
-    3. ``POST .../rate-limit-reset-credits/consume`` with a fresh UUID
-       idempotency key (``redeem_request_id``). No ``credit_id`` — the
-       backend picks the next available credit, exactly like the CLI's
-       default "Full reset" option.
+    3. ``POST .../rate-limit-reset-credits/consume`` with a caller supplied
+       idempotency key (``redeem_request_id``) or a freshly generated UUID.
+       No ``credit_id`` — the backend picks the next available credit, exactly
+       like the CLI's default "Full reset" option.
 
     Never raises: every failure mode returns a ``CodexResetRedeemResult``
     with a user-renderable message.
     """
-    import uuid
+    explicit_request_id = str(redeem_request_id or "").strip()
+    if explicit_request_id:
+        try:
+            if str(uuid.UUID(explicit_request_id)) != explicit_request_id:
+                raise ValueError("not canonical")
+        except (TypeError, ValueError):
+            return CodexResetRedeemResult(
+                status="unavailable",
+                message=(
+                    "Invalid redeem_request_id. Supply a canonical UUID string to preserve "
+                    "backend idempotency across retries."
+                ),
+            )
+    else:
+        explicit_request_id = ""
 
     try:
-        token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
+        token, resolved_base_url, resolved_account_id = _resolve_codex_usage_credentials(base_url, api_key)
     except Exception:
         return CodexResetRedeemResult(
             status="unavailable",
             message="No Codex credentials available. Run `hermes auth` to sign in with your ChatGPT account.",
         )
+    explicit_account_id = str(account_id or "").strip()
+    if explicit_account_id:
+        resolved_account_id = explicit_account_id
     usage_url, _credits_url, consume_url = _codex_backend_urls(resolved_base_url)
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "User-Agent": "codex-cli",
     }
-    if account_id:
-        headers["ChatGPT-Account-Id"] = account_id
+    if resolved_account_id:
+        headers["ChatGPT-Account-Id"] = resolved_account_id
 
     try:
         with httpx.Client(timeout=15.0) as client:
@@ -670,7 +690,7 @@ def redeem_codex_reset_credit(
             consume_resp = client.post(
                 consume_url,
                 headers={**headers, "Content-Type": "application/json"},
-                json={"redeem_request_id": str(uuid.uuid4())},
+                json={"redeem_request_id": explicit_request_id or str(uuid.uuid4())},
             )
             consume_resp.raise_for_status()
             body = consume_resp.json() or {}
